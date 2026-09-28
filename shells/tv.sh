@@ -1,5 +1,6 @@
 #!/bin/bash
-# wget -O tv.sh https://cafe.cpolar.cn/wkdaily/tvhelper-docker/raw/branch/master/shells/tv.sh && chmod +x tv.sh && ./tv.sh
+# version=1.1.5
+#wget -O tv.sh https://cafe.cpolar.cn/wkdaily/tvhelper-docker/raw/branch/master/shells/tv.sh && chmod +x tv.sh && ./tv.sh
 source common.sh
 apk_path="/tvhelper/apks/"
 # 定义红色文本
@@ -20,23 +21,13 @@ declare -A commands_essentials
 declare -a tv_model_options
 declare -A tv_model_commands
 
-# 设置全局快捷键p
+# 设置全局命令 p
 cp -f "$0" /usr/local/bin/t
 chmod +x /usr/local/bin/t
 
-
 get_docker_version() {
-    # 尝试从 /etc/environment 读取 APP_VERSION
-    if [ -f /etc/environment ]; then
-    source /etc/environment
-    fi
-    if [ -n "$APP_VERSION" ]; then
-        version=$APP_VERSION
-    else
-        # 若 /etc/environment 中的 APP_VERSION 为空，使用默认值
-        version="1.0.6"
-    fi
-    echo $version
+    VERSION=$(grep -E '^VERSION=' /etc/environment | cut -d '=' -f2)
+    echo $VERSION
 }
 
 # 使用get_docker_version函数
@@ -57,75 +48,204 @@ is_integer() {
 
 # 判断adb是否连接成功
 check_adb_connected() {
-    # 获取 adb devices 输出,跳过第一行（标题行）,并检查每一行的状态
-    local connected_devices=$(adb devices | awk 'NR>1 {print $2}' | grep 'device$')
-    # 检查是否有设备已连接并且状态为 'device',即已授权
-    if [[ -n $connected_devices ]]; then
-        # ADB 已连接并且设备已授权
-        return 0
-    else
-        # ADB 设备未连接或未授权
-        return 1
+    local target_address="${1:-}"
+    local device_status
+
+    if [[ -n "$target_address" ]]; then
+        device_status=$(adb devices 2>/dev/null | awk -v target="$target_address" 'NR > 1 && $1 == target {print $2; exit}')
+        printf '%s' "$device_status"
+        [[ "$device_status" == "device" ]]
+        return
     fi
+
+    # 未指定地址时保持原有行为：任一已授权设备在线即视为已连接。
+    adb devices 2>/dev/null | awk 'NR > 1 && $2 == "device" {found = 1} END {exit(found ? 0 : 1)}'
 }
 
 # 函数用于检查IP地址的合法性
 is_valid_ip() {
-    if [[ $1 =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        IFS='.' read -ra ip_parts <<<"$1"
-        for i in "${ip_parts[@]}"; do
-            if ((i < 0 || i > 255)); then
-                return 1
-            fi
-        done
-        return 0
-    else
+    local ip="$1"
+    local part
+    local -a ip_parts=()
+
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a ip_parts <<<"$ip"
+    for part in "${ip_parts[@]}"; do
+        if ((10#$part > 255)); then
+            return 1
+        fi
+    done
+    return 0
+}
+
+# 检查ADB端口是否合法
+is_valid_adb_port() {
+    local port="$1"
+
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+    while [[ ${#port} -gt 1 && "${port:0:1}" == "0" ]]; do
+        port=${port:1}
+    done
+    if [[ ${#port} -gt 5 ]] || ((10#$port < 1 || 10#$port > 65535)); then
         return 1
     fi
+    return 0
 }
-#连接adb并记录上次的ip
+
+#连接adb并记录上次成功的完整地址
 connect_adb() {
+    local history_file="/tvhelper/shells/history"
+    local last_address=""
+    local last_name=""
+    local input_address=""
+    local ip=""
+    local port=""
+    local endpoint=""
+    local use_pairing=""
+    local pair_port=""
+    local debug_port=""
+    local pair_result=0
+    local connect_output=""
+    local connect_output_lower=""
+    local connect_result=0
+    local device_status=""
+    local previous_status=""
+    local retry_count=30
+    local i=0
+
     adb disconnect >/dev/null 2>&1
-    history_file="/tvhelper/shells/history"
+
+    # 读取上次成功连接的完整地址；兼容旧历史中只保存IP的格式。
     if [[ -f "$history_file" ]]; then
-        last_ip=$(tail -n 1 "$history_file")
+        last_address=$(tail -n 1 "$history_file")
         last_name=$(head -n 1 "$history_file")
-        # 检查历史中的IP地址是否合法
-        if is_valid_ip "$last_ip"; then
-            echo -e "上次连接的设备是 ${GREEN}${last_name}${NC}IP地址为 ${GREEN}${last_ip}${NC}\n您是否要再次连接到此设备?确认请直接回车,否定输入n再回车[Y/n]"
-            read answer
-            if [[ "$answer" == "N" || "$answer" == "n" ]]; then
-                echo -e "${YELLOW}请手动输入电视盒子的完整IP地址:${NC}"
-                read ip
-            else
-                ip=$last_ip
-            fi
-        else
-            echo -e "${RED}历史记录中的IP地址不合法,请手动输入电视盒子的完整IP地址:${NC}"
-            read ip
+        if is_valid_ip "$last_address"; then
+            last_address="${last_address}:5555"
         fi
-    else
-        echo -e "${YELLOW}请手动输入电视盒子的完整IP地址:${NC}"
-        read ip
     fi
 
-    echo -e "${BLUE}首次使用,盒子上可能会提示授权弹框,给您半分钟时间来操作...【允许】${NC}"
-    adb connect ${ip}
+    while true; do
+        if [[ -n "$last_address" ]]; then
+            echo -e "上次成功连接的设备是 ${GREEN}${last_name}${NC}，地址为 ${GREEN}${last_address}${NC}"
+            read -r -p "请输入 IPv4 或 IPv4:端口（直接回车使用上次地址，也可输入新端口）: " input_address
+            input_address=${input_address:-$last_address}
+        else
+            read -r -p "请输入设备的 IPv4 或 IPv4:端口（只输入 IP 时使用 5555）: " input_address
+        fi
 
-    for ((i = 1; i <= 30; i++)); do
-        echo -e "${YELLOW}第${i}次尝试连接ADB,请在设备上点击【允许】按钮...${NC}"
-        device_status=$(adb devices | grep "${ip}:5555" | awk '{print $2}')
+        if [[ "$input_address" == *:* ]]; then
+            ip=${input_address%%:*}
+            port=${input_address##*:}
+            if [[ "$input_address" != *:*:* ]] && is_valid_ip "$ip" && is_valid_adb_port "$port"; then
+                while [[ ${#port} -gt 1 && "${port:0:1}" == "0" ]]; do
+                    port=${port:1}
+                done
+                endpoint="${ip}:${port}"
+                break
+            fi
+        elif is_valid_ip "$input_address"; then
+            ip=$input_address
+            port="5555"
+            endpoint="${ip}:${port}"
+            break
+        fi
+
+        echo -e "${RED}输入不合法。请输入有效的 IPv4 地址，端口必须是 1～65535 的整数。${NC}"
+    done
+
+    echo -e "${YELLOW}是否使用【配对码】流程？只有电视提供“使用配对码配对设备”时才需要。输入 y 使用，其它直接回车普通连接 [y/N]:${NC}"
+    read -r use_pairing
+
+    if [[ "$use_pairing" == "y" || "$use_pairing" == "Y" ]]; then
+        retry_count=35
+        echo -e "${YELLOW}请点击【使用配对码配对设备】出现与设备配对的页面${NC}"
+        while true; do
+            read -r -p "请输入该页面显示的配对端口号（例如 35295）: " pair_port
+            if is_valid_adb_port "$pair_port"; then
+                while [[ ${#pair_port} -gt 1 && "${pair_port:0:1}" == "0" ]]; do
+                    pair_port=${pair_port:1}
+                done
+                break
+            fi
+            echo -e "${RED}配对端口不合法，必须是 1～65535 的整数。${NC}"
+        done
+
+        echo -e "${BLUE}正在配对设备，请按要求输入WLAN配对码 通常是6位${NC}"
+        adb pair "${ip}:${pair_port}"
+        pair_result=$?
+        if ((pair_result != 0)); then
+            echo -e "${RED}配对失败，请检查配对端口/配对码是否正确${NC}"
+            return 1
+        fi
+        echo -e "${GREEN}配对成功，请返回无线调试页面查看调试端口。${NC}"
+
+        while true; do
+            read -r -p "请输入设备显示的调试端口号: " debug_port
+            if is_valid_adb_port "$debug_port"; then
+                while [[ ${#debug_port} -gt 1 && "${debug_port:0:1}" == "0" ]]; do
+                    debug_port=${debug_port:1}
+                done
+                endpoint="${ip}:${debug_port}"
+                break
+            fi
+            echo -e "${RED}调试端口不合法，必须是 1～65535 的整数。${NC}"
+        done
+    fi
+
+    connect_output=$(adb connect "$endpoint" 2>&1)
+    connect_result=$?
+    printf '%s\n' "$connect_output"
+    connect_output_lower=${connect_output,,}
+    device_status=$(check_adb_connected "$endpoint")
+
+    if [[ "$device_status" != "device" && "$device_status" != "unauthorized" && "$device_status" != "offline" ]] &&
+        { ((connect_result != 0)) || [[ "$connect_output_lower" =~ (failed|unable|cannot|refused|error) ]]; }; then
+        echo -e "${RED}ADB 连接失败：${endpoint}，请检查 IP、端口及电视的 ADB 调试设置。${NC}"
+        return 1
+    fi
+
+    for ((i = 1; i <= retry_count; i++)); do
+        device_status=$(check_adb_connected "$endpoint")
         if [[ "$device_status" == "device" ]]; then
-            echo -e "${GREEN}ADB 已经连接成功啦,你可以放心操作了${NC}"
-            # 连接成功后，写入名称和IP地址到历史文件
-            echo "$(get_history_name)" >"$history_file"
-            echo "${ip}" >>"$history_file"
+            echo -e "${GREEN}ADB 已连接且已授权：${endpoint}${NC}"
+            printf '%s\n' "$(get_history_name)" >"$history_file"
+            printf '%s\n' "$endpoint" >>"$history_file"
             return 0
         fi
+
+        if [[ "$device_status" != "$previous_status" ]]; then
+            case "$device_status" in
+            unauthorized)
+                echo -e "${YELLOW}设备尚未授权，请在电视上点击【允许】。${NC}"
+                ;;
+            offline)
+                echo -e "${YELLOW}设备当前处于 offline 状态，正在等待恢复。${NC}"
+                ;;
+            esac
+            previous_status=$device_status
+        fi
+        echo -e "${YELLOW}第${i}次尝试连接 ${endpoint}，请在设备上点击【允许】...${NC}"
         sleep 1
     done
-    echo -e "${RED}连接超时,或者您点击了【取消】,请确认电视盒子的IP地址是否正确。如果问题持续存在,请检查设备的USB调试设置是否正确并重新连接adb${NC}"
+
+    if [[ -z "$device_status" && ("$previous_status" == "unauthorized" || "$previous_status" == "offline") ]]; then
+        device_status=$previous_status
+    fi
+
+    case "$device_status" in
+    unauthorized)
+        echo -e "${RED}ADB 未授权：请在电视上允许 ${endpoint} 的调试请求后重试。${NC}"
+        ;;
+    offline)
+        echo -e "${RED}ADB 设备离线：${endpoint} 当前为 offline，请重启 ADB 调试后重试。${NC}"
+        ;;
+    *)
+        echo -e "${RED}ADB 连接失败：未在 adb devices 中找到 ${endpoint}，请检查 IP、端口及网络。${NC}"
+        ;;
+    esac
+    return 1
 }
+
 
 # 一键修改NTP服务器地址
 modify_ntp() {
@@ -236,7 +356,7 @@ input_text() {
     echo -e "${BLUE}注意注意注意！请弹出键盘后再执行!每次输入会自动清空上次结果${NC}"
     if check_adb_connected; then
         while true; do
-            echo -e "仅支持英文字符和常规简单网址 不能支持 & * ? ,不建议重度使用此功能,重度使用请使用蓝牙键盘\n${YELLOW}如果输入clash订阅地址强烈建议使用第10项,${NC}\n ADB不适合处理特殊字符,且Openwrt下的adb版本也较低) \n输入【q】退出。输入【qk】删除20个字符。输入【blue】搜索蓝牙键盘。请您输入"
+            echo -e "仅支持英文字符和常规简单网址 不能支持 & * ? ,不建议重度使用此功能,重度使用请使用蓝牙键盘\n${YELLOW}如果输入clash订阅地址强烈建议使用电视订阅助手,${NC}\n ADB不适合处理特殊字符,且Openwrt下的adb版本也较低) \n输入【q】退出。输入【qk】删除20个字符。输入【blue】搜索蓝牙键盘。请您输入"
             read str
 
             if [[ $str == "q" ]]; then
@@ -324,12 +444,12 @@ install_apk() {
 install_all_apks() {
     if check_adb_connected; then
         # 获取/tmp/upload目录下的apk文件列表
-        apk_files=($(ls /tvhelper/shells/data/*.apk 2>/dev/null))
+        apk_files=($(ls ${DATA_DIR}/*.apk 2>/dev/null))
         total_files=${#apk_files[@]}
 
         # 检查是否有APK文件
         if [ "$total_files" -eq "0" ]; then
-            echo -e "${RED}/tvhelper/shells/data/ 目录下不包含任何apk文件,请先拷贝apk文件到此目录.${NC}"
+            echo -e "${RED}${DATA_DIR}/ 目录下不包含任何apk文件,请先拷贝apk文件到此目录.${NC}"
             return 1
         fi
 
@@ -402,10 +522,22 @@ install_emotn_store() {
     install_apk "${apk_path}emotn.apk" "com.overseas.store.appstore"
 }
 
+# 安装Aptoide TV
+install_aptoidetv(){
+    echo -e "${BLUE}安装过程若出现弹框,请点击详情后选择【仍然安装】即可${NC}"
+    install_apk "${apk_path}aptoidetv.apk" "cm.aptoidetv.pt.cvt_hv553"
+}
+
 # 安装当贝市场
 install_dbmarket() {
     echo -e "${BLUE}安装过程若出现弹框,请点击详情后选择【仍然安装】即可${NC}"
     install_apk "${apk_path}dangbeimarket.apk" "com.dangbeimarket"
+}
+
+# 安装沙发管家
+install_shafa() {
+    echo -e "${BLUE}安装过程若出现弹框,请点击详情后选择【仍然安装】即可${NC}"
+    install_apk "${apk_path}sfgj.apk" "com.shafa.market"
 }
 
 # 安装网络获取的apk
@@ -452,15 +584,14 @@ install_web_apk() {
 # 安装my-tv
 # release地址、包名、apk命名前缀
 install_mytv_latest_apk() {
-    echo -e "${BLUE}项目主页:https://github.com/lizongying/my-tv ${NC}"
+    echo -e "${BLUE}项目主页:https://github.com/yaoxieyoulei/mytv-android ${NC}"
     install_apk "${apk_path}mytv.apk" "com.lizongying.mytv"
 }
 
-# 安装bbll
+# 安装EASY installer
 # release地址、包名、apk命名前缀
-install_BBLL_latest_apk() {
-    echo -e "${BLUE}项目主页:https://github.com/xiaye13579/BBLL ${NC}"
-    install_apk "${apk_path}bbll.apk" "com.xx.blbl"
+install_upan_apk() {
+    install_apk "${apk_path}upan.apk" "com.atv.easy.installer"
 }
 
 #根据apk地址和包名 安装apk
@@ -611,6 +742,76 @@ get_tvbox_timezone() {
     fi
 }
 
+
+
+# ==========================
+# 批量安装目录中的 APK / XAPK / APKM
+# ==========================
+do_install_all_packages() {
+    local supported_exts=("apk" "xapk" "apkm")
+
+    for ext in "${supported_exts[@]}"; do
+        for file in "${DATA_DIR}"/*."$ext"; do
+            if [ -f "$file" ]; then
+                echo -e "\n========== 处理文件: $(basename "$file") =========="
+                install_app_package "$file"
+            fi
+        done
+    done
+}
+
+
+# 支持xapk/apkm/apk三种格式的安装函数
+install_app_package() {
+    local file_path="$1"
+    local filename=$(basename "$file_path")
+    local ext="${filename##*.}"
+
+    local timestamp=$(date +%H%M%S)
+    local extract_to="/tmp/app_pkgs/${timestamp}"
+    mkdir -p "$extract_to"
+
+    case "$ext" in
+        xapk|apkm)
+            if unzip -o "$file_path" -d "$extract_to"; then
+                echo "$ext 文件解压成功: $filename"
+            else
+                echo "$ext 文件解压失败: $filename"
+                return 1
+            fi
+            apk_files=$(find "$extract_to" -type f -name "*.apk")
+            ;;
+        apk)
+            apk_files="$file_path"
+            ;;
+        *)
+            echo "不支持的文件类型: $ext"
+            return 1
+            ;;
+    esac
+
+    echo -e "准备安装:\n$apk_files"
+    echo -ne "${YELLOW}正在安装: $filename${NC} ${GREEN}\n"
+
+    # 模拟进度
+    while true; do echo -n ".."; sleep 1; done &
+    PROGRESS_PID=$!
+
+    install_result=$(adb install-multiple $apk_files 2>&1)
+
+    kill $PROGRESS_PID >/dev/null 2>&1
+    wait $PROGRESS_PID 2>/dev/null
+    echo -e "${NC}\n安装结果: $install_result"
+
+    if echo "$install_result" | grep -qi "Success"; then
+        echo -e "${GREEN}安装成功: $filename${NC}"
+        rm -rf "$extract_to"
+    else
+        echo -e "${RED}安装失败: $filename${NC}"
+    fi
+}
+
+
 # 安装mix apps 用于显示全部app
 install_mixapps() {
     local xapk_local_path="${apk_path}mix.xapk"
@@ -723,14 +924,11 @@ update_sh() {
 menu_options=(
     "连接ADB"
     "断开ADB"
-    "安装Android原生TV必备精选Apps"
+    "安装Android原生TV必备精选Apps(含子菜单)"
     "一键修改NTP(限原生TV,需重启)"
     "安装Play商店图标(仅google tv使用)"
-    "自定义批量安装data目录下的所有apk"
+    "一键安装/data目录下所有apk/xapk/apkm (适合流媒体app)"
     "替换系统桌面"
-    "进入KODI助手"
-    "进入TVBox安装助手"
-    "进入Sony电视助手"
     "向TV端输入文字(限英文)"
     "显示Netflix影片码率"
     "模拟菜单键"
@@ -741,16 +939,13 @@ menu_options=(
 commands=(
     ["连接ADB"]="connect_adb"
     ["断开ADB"]="disconnect_adb"
-    ["安装Android原生TV必备精选Apps"]="android_tv_essentials"
+    ["安装Android原生TV必备精选Apps(含子菜单)"]="android_tv_essentials"
     ["一键修改NTP(限原生TV,需重启)"]="modify_ntp"
     ["向TV端输入文字(限英文)"]="input_text"
     ["显示Netflix影片码率"]="show_nf_info"
     ["模拟菜单键"]="show_menu_keycode"
     ["安装Play商店图标(仅google tv使用)"]="show_playstore_icon"
-    ["自定义批量安装data目录下的所有apk"]="install_all_apks"
-    ["进入KODI助手"]="kodi_helper"
-    ["进入TVBox安装助手"]="enter_tvbox_helper"
-    ["进入Sony电视助手"]="enter_sonytv"
+    ["一键安装/data目录下所有apk/xapk/apkm (适合流媒体app)"]="do_install_all_packages"
     ["更新脚本"]="update_sh"
     ["赞助|打赏"]="sponsor"
     ["替换系统桌面"]="replace_system_ui_menu"
@@ -759,24 +954,27 @@ commands=(
 item_options=(
     "安装电视订阅助手"
     "安装Emotn Store应用商店"
+    "安装Aptoide TV应用商店"
     "安装当贝市场"
-    "安装my-tv(lizongying)"
-    "安装BBLL(xiaye13579)"
+    "安装沙发管家"
     "安装文件管理器+"
     "安装Downloader"
     "安装Mix-Apps用于显示全部应用"
+    "安装U盘安装器Easy Installer"
     "返回主菜单"
 )
 
 commands_essentials=(
     ["安装电视订阅助手"]="install_subhelper_apk"
     ["安装Emotn Store应用商店"]="install_emotn_store"
+    ["安装Aptoide TV应用商店"]="install_aptoidetv"
     ["安装当贝市场"]="install_dbmarket"
-    ["安装my-tv(lizongying)"]="install_mytv_latest_apk"
-    ["安装BBLL(xiaye13579)"]="install_BBLL_latest_apk"
+    ["安装新版我的电视"]="install_mytv_latest_apk"
+    ["安装U盘安装器Easy Installer"]="install_upan_apk"
     ["安装文件管理器+"]="install_file_manager_plus"
     ["安装Downloader"]="install_downloader"
     ["安装Mix-Apps用于显示全部应用"]="install_mixapps"
+    ["安装沙发管家"]="install_shafa"
 )
 
 # 替换或恢复系统桌面
@@ -919,7 +1117,7 @@ replace_normal_androidtv_ui() {
     toggle_system_ui "${system_ui_package}"
 }
 
-check_emotnui_installed(){
+check_emotnui_installed() {
     local package_name="com.oversea.aslauncher"
     local apk_path="/tvhelper/apks/ui.apk"
 
@@ -947,7 +1145,7 @@ check_emotnui_installed(){
 toggle_googletv_system_ui() {
     local system_ui_package="com.google.android.apps.tv.launcherx"
     local system_setup_package="com.google.android.tungsten.setupwraith"
-    #判断emotnui是否安装 
+    #判断emotnui是否安装
     check_emotnui_installed
 
     # 检查系统桌面是否已被禁用
@@ -976,7 +1174,7 @@ toggle_googletv_system_ui() {
 # 替换或恢复系统桌面
 toggle_system_ui() {
     local system_ui_package=$1
-    #判断emotnui是否安装 
+    #判断emotnui是否安装
     check_emotnui_installed
 
     # 检查系统桌面是否已被禁用
@@ -1035,12 +1233,12 @@ handle_choice() {
 }
 
 show_menu() {
-    mkdir -p /tvhelper/shells/data
+    mkdir -p ${DATA_DIR}
     clear
     echo "***********************************************************************"
-    echo -e "*      ${YELLOW}盒子助手Docker版 (v${docker_version})${NC}        "
-    echo -e "*      ${GREEN}base Alpine Linux${NC}         "
+    echo -e "*      ${YELLOW}盒子助手Docker版 (v$(get_docker_version))${NC}        "
     echo -e "*      ${RED}请确保电视盒子和Docker宿主机处于${NC}${BLUE}同一网段${NC}\n*      ${RED}且电视盒子开启了${NC}${BLUE}USB调试模式(adb开关)${NC}         "
+    echo -e "*      ${YELLOW}【注意】再次运行 只输入 t 即可 ${NC}        "
     echo "**********************************************************************"
     echo "$(get_status)"
     echo "$(get_tvbox_model_name)"
