@@ -1,0 +1,18 @@
+# LXC120 的 Portainer Stack：tvhelper
+services:
+  tvhelper:
+    image: tvhelper-custom:v1.1.5-port1
+    container_name: tvhelper
+    restart: unless-stopped
+    ports:
+      - "15000:15000"
+    volumes:
+      - /data/appdata/tvhelper/data:/data
+      - /data/appdata/tvhelper/adb:/root/.android
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

@@ -1,0 +1,9 @@
+.git
+shells/tv-v1.1.5.sh
+*.diff
+*.patch
+*.tmp
+*.bak
+*.orig
+*.rej
+*~
